@@ -93,7 +93,7 @@ impl TimetableWorld for World {
 
 impl Schedule {
     /// `clock` gives the date: tours carry a validity mask (bits 0-6 Monday…Sunday, 7 public
-    /// holiday, 8 school holidays, 9 school days) that selects which run today.
+    /// holiday, 8 school days, 9 school holidays) that selects which run today.
     pub fn new(root: &Path, world: &World, clock: &omsi_sim::SimClock) -> Schedule {
         Schedule {
             sim: ScheduleSim::new(root, world, clock),
@@ -138,18 +138,20 @@ impl Schedule {
         world: &World,
         traffic: Option<&Traffic>,
         duty: Option<&PlayerDuty>,
-        player_hof: Option<&omsi_vehicle::Hof>,
         clock: &omsi_sim::SimClock,
     ) {
         let now = clock.time;
         let mut boards = world.timetable_boards.lock();
         boards.clock = Some(clock.clone());
-        if self.sim.boards_fresh(now) || (boards.wanted.is_empty() && boards.wanted_names.is_empty()) {
+        // (a stop a page asks for anew is made at once, not up to a second later: the boards of
+        // the map's own displays may just have been made without it)
+        let new_name = boards.wanted_names.iter().any(|k| !boards.departures.contains_key(k));
+        if (self.sim.boards_fresh(now) && !new_name) || (boards.wanted.is_empty() && boards.wanted_names.is_empty()) {
             return;
         }
         let (wanted, wanted_names) = (boards.wanted.clone(), boards.wanted_names.clone());
         let (by_stop, departures) =
-            self.sim.make_boards(traffic.map(|t| &t.sim), wanted, wanted_names, duty, player_hof, clock);
+            self.sim.make_boards(traffic.map(|t| &t.sim), wanted, wanted_names, duty, clock);
         boards.by_stop = by_stop;
         boards.departures = departures;
         boards.departures_gen = boards.departures_gen.wrapping_add(1);

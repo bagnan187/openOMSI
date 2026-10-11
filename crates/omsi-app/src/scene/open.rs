@@ -1,6 +1,34 @@
 //! Opening a map: global.cfg, object and spline types, the navigation map.
 use super::*;
 
+/// What is being read right now, by key: the tiles are read side by side, and two of them
+/// that name the same type both read it when it was not there yet (the second copy then
+/// thrown away). With this the second waits for the first's. Only for reads that run to
+/// their end on their own thread - no worker pool inside, no other key asked for, no lock
+/// the waiting threads could hold - so that the wait cannot close a circle.
+pub(crate) struct OnceByKey<T>(Mutex<HashMap<String, Arc<std::sync::OnceLock<T>>>>);
+
+impl<T> Default for OnceByKey<T> {
+    fn default() -> Self {
+        OnceByKey(Mutex::new(HashMap::new()))
+    }
+}
+
+impl<T: Clone> OnceByKey<T> {
+    /// `read`'s result for `key`, read once by whoever asks first while the others wait.
+    /// `read` should leave its result where later callers look first: the key is
+    /// forgotten here as soon as it is read.
+    pub(crate) fn once(&self, key: &str, read: impl FnOnce() -> T) -> T {
+        let cell = self.0.lock().entry(key.to_string()).or_default().clone();
+        let value = cell.get_or_init(read).clone();
+        let mut loads = self.0.lock();
+        if loads.get(key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+            loads.remove(key);
+        }
+        value
+    }
+}
+
 impl World {
     pub fn open(root: &Path, global_cfg: &Path, date: i32) -> Result<World> {
         let global = GlobalCfg::load(global_cfg)
@@ -81,6 +109,8 @@ impl World {
             ticket_pack,
             object_types: Mutex::new(HashMap::new()),
             spline_types: Mutex::new(HashMap::new()),
+            object_type_loads: Default::default(),
+            spline_type_loads: Default::default(),
             textures: Arc::new(TextureCache::new()),
             object_positions: Mutex::new(HashMap::new()),
             object_dups: Mutex::new(HashMap::new()),
@@ -127,6 +157,7 @@ impl World {
             light_map_atlas: Mutex::new(None),
             parked_live: std::sync::atomic::AtomicUsize::new(0),
             parked_max: crate::settings::Settings::load().ai_max_parked as i64,
+            signal_ids: signal_routes.iter().flat_map(|r| std::iter::once(r.signal.0).chain(r.dist_signal)).collect(),
             signal_routes,
             particle_objects: Mutex::new(HashMap::new()),
             fonts: Arc::new(Mutex::new(omsi_sim::texttex::FontLibrary::new(root))),
@@ -169,6 +200,15 @@ impl World {
             look.map(|l| format!("@{}", l.as_deref().unwrap_or("summer").to_ascii_lowercase())).unwrap_or_default()
         );
         if let Some(t) = self.object_types.lock().get(&key) {
+            return t.clone();
+        }
+        self.object_type_loads.once(&key, || self.read_object_type(&key, rel, scheme, look))
+    }
+
+    /// `object_type_look`'s read of a type not read yet, kept under `key`.
+    fn read_object_type(&self, key: &str, rel: &str, scheme: Option<usize>, look: Option<&Option<String>>) -> Option<Arc<ObjectType>> {
+        if let Some(t) = self.object_types.lock().get(key) {
+            // (read by another meanwhile)
             return t.clone();
         }
         let path = omsi_cfg::resolve_path(&self.root, rel);
@@ -327,27 +367,10 @@ impl World {
                 }
             }
             let paint_scheme_count = paint_schemes.len();
-            // scripts (or an empty program) for objects that are scripted or animated
-            let animated = mesh_def_index.iter().any(|d| {
-                !model.meshes[*d].animations.is_empty() || model.meshes[*d].visible.is_some()
+            let has_mouse_events = mesh_def_index.iter().any(|d| {
+                model.meshes.get(*d).and_then(|m| m.mouse_event.as_ref()).is_some()
             });
-            let has_freetex = mesh_def_index.iter().any(|d| {
-                model.meshes[*d].materials.iter().any(|o| !o.item && o.freetex.is_some())
-            });
-            let program = if !sco.scripts.scripts.is_empty()
-                || !sco.scripts.stringvarlists.is_empty()
-                || !sco.scripts.varlists.is_empty()
-                || has_freetex
-                || animated
-                || sco.sound.is_some()
-            {
-                Some(Arc::new(omsi_sim::scenery::compile_scenery(
-                    &self.root,
-                    &sco.scripts,
-                )))
-            } else {
-                None
-            };
+            let program = object_program(&self.root, &sco, &model, &mesh_def_index, has_mouse_events);
             let mesh_shadow = mesh_def_index
                 .iter()
                 .map(|d| model.meshes[*d].is_shadow)
@@ -434,6 +457,7 @@ impl World {
                 mesh_pivots,
                 mesh_shadow,
                 mesh_casts,
+                has_mouse_events,
                 program,
                 lower_lods,
                 lod0_min,
@@ -457,7 +481,7 @@ impl World {
         // so that it is uploaded (and evicted) once
         self.object_types
             .lock()
-            .entry(key)
+            .entry(key.to_string())
             .or_insert(loaded)
             .clone()
     }
@@ -465,6 +489,14 @@ impl World {
     pub fn spline_type(&self, rel: &str) -> Option<Arc<SplineType>> {
         let key = rel.to_ascii_lowercase().replace('\\', "/");
         if let Some(t) = self.spline_types.lock().get(&key) {
+            return t.clone();
+        }
+        self.spline_type_loads.once(&key, || self.read_spline_type(&key, rel))
+    }
+
+    /// `spline_type`'s read of a type not read yet, kept under `key`.
+    fn read_spline_type(&self, key: &str, rel: &str) -> Option<Arc<SplineType>> {
+        if let Some(t) = self.spline_types.lock().get(key) {
             return t.clone();
         }
         let path = omsi_cfg::resolve_path(&self.root, rel);
@@ -477,11 +509,12 @@ impl World {
                 let dirs = texture_dirs(&self.root, &dir);
                 let dirs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
                 let surf = def.textures.iter().map(|t| surf_map(&t.file, &dirs)).collect();
-                Arc::new(SplineType { dir, def, surf })
+                let surface = def.textures.iter().map(|t| surface_id(&t.file, &dirs)).collect();
+                Arc::new(SplineType { dir, def, surf, surface })
             });
         self.spline_types
             .lock()
-            .entry(key)
+            .entry(key.to_string())
             .or_insert(loaded)
             .clone()
     }
@@ -506,29 +539,27 @@ impl World {
 pub fn navigation_map_of(root: &Path, tiles: &[(i32, i32, PathBuf)], chrono_dirs: &[PathBuf]) -> NavigationMap {
     use rayon::prelude::*;
     let t0 = std::time::Instant::now();
-    let scos: Mutex<HashMap<String, Option<Arc<SceneryObject>>>> = Mutex::new(HashMap::new());
+    // (each file read once: a tile that wants one being read waits for it, rather than
+    // reading it too - see `OnceByKey`)
+    type Once<T> = Arc<std::sync::OnceLock<Option<Arc<T>>>>;
+    let scos: Mutex<HashMap<String, Once<SceneryObject>>> = Mutex::new(HashMap::new());
     let sco_of = |file: &str| -> Option<Arc<SceneryObject>> {
         let key = file.trim().to_ascii_lowercase().replace('\\', "/");
-        if let Some(v) = scos.lock().get(&key) {
-            return v.clone();
-        }
-        let v = SceneryObject::load(&omsi_cfg::resolve_path(root, file)).ok().map(Arc::new);
-        scos.lock().insert(key, v.clone());
-        v
+        let cell = scos.lock().entry(key).or_default().clone();
+        cell.get_or_init(|| SceneryObject::load(&omsi_cfg::resolve_path(root, file)).ok().map(Arc::new)).clone()
     };
-    let slis: Mutex<HashMap<String, Option<Arc<Spline>>>> = Mutex::new(HashMap::new());
+    let slis: Mutex<HashMap<String, Once<Spline>>> = Mutex::new(HashMap::new());
     let sli_of = |file: &str| -> Option<Arc<Spline>> {
         // (the navigator loads `.sli` through `World::spline_type` with the same two calls)
         let key = file.trim().to_ascii_lowercase().replace('\\', "/");
-        if let Some(v) = slis.lock().get(&key) {
-            return v.clone();
-        }
-        let v = Spline::load(&omsi_cfg::resolve_path(root, file)).ok().map(|def| {
-            omsi_geometry::register_half_cant_width(file, &def);
-            Arc::new(def)
-        });
-        slis.lock().insert(key, v.clone());
-        v
+        let cell = slis.lock().entry(key).or_default().clone();
+        cell.get_or_init(|| {
+            Spline::load(&omsi_cfg::resolve_path(root, file)).ok().map(|def| {
+                omsi_geometry::register_half_cant_width(file, &def);
+                Arc::new(def)
+            })
+        })
+        .clone()
     };
     #[allow(clippy::type_complexity)]
     let parts: Vec<(Vec<Lane>, Vec<(i64, DVec3)>, Vec<(DVec3, f64, String)>, Vec<(Vec<DVec3>, f32)>)> = tiles
@@ -691,4 +722,34 @@ pub(super) fn is_street_sign(file: &str) -> bool {
     let f = file.to_ascii_lowercase().replace(['\\', '_', ' ', '-'], "");
     let name = f.rsplit('/').next().unwrap_or(&f);
     ["streetsign", "streetname", "strschild", "strassenschild", "straßenschild", "strassenname", "roadsignname", "roadname"].iter().any(|k| name.contains(k))
+}
+
+fn object_program(
+    root: &Path,
+    sco: &SceneryObject,
+    model: &Model,
+    mesh_def_index: &[usize],
+    has_mouse_events: bool,
+) -> Option<Arc<omsi_script::Program>> {
+    let animated = mesh_def_index.iter().any(|d| {
+        !model.meshes[*d].animations.is_empty() || model.meshes[*d].visible.is_some()
+    });
+    let has_freetex = mesh_def_index.iter().any(|d| {
+        model.meshes[*d].materials.iter().any(|o| !o.item && o.freetex.is_some())
+    });
+    if !sco.scripts.scripts.is_empty()
+        || !sco.scripts.stringvarlists.is_empty()
+        || !sco.scripts.varlists.is_empty()
+        || has_freetex
+        || animated
+        || has_mouse_events
+        || sco.sound.is_some()
+    {
+        Some(Arc::new(omsi_sim::scenery::compile_scenery(
+            root,
+            &sco.scripts,
+        )))
+    } else {
+        None
+    }
 }

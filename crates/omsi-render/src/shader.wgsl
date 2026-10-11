@@ -29,6 +29,16 @@ struct Camera {
     // Windy trees: xy the weather's wind (m/s, world; 0 with the setting off), zw how far
     // the air has carried the gusts since the start (m, modulo PATTERN_PERIOD)
     tree_wind: vec4<f32>,
+    // an articulated bus's rear section (as inside_*): read by the snowfall only - a test of
+    // it here, inlined into every use of inside_vehicle, brought Apple's M4 shader compiler
+    // down (see 0.2.21's Metal note)
+    inside2_a: vec4<f32>,
+    inside2_b: vec4<f32>,
+    inside2_c: vec4<f32>,
+    // Enhanced: the field each light cookie layer covers (xy: the tangents of its half
+    // angles across and up; z: its first record in the light buffer), see enhanced.wgsl
+    // `cookie_light`
+    cookies: array<vec4<f32>, 8>,
 };
 
 // 1 when the point lies inside the player's vehicle (its [boundingbox], shrunk a little so
@@ -360,7 +370,8 @@ struct MaterialParams {
     wipe_bounds: vec4<f32>,
     // x: [matl_glow] strength (0 = the keyword is not there; the material is its own light -
     // its `t_light` is a greyscale mask of how much shines where, its colour is its own, see
-    // the enhanced pass), y/z/w free
+    // the enhanced pass), y an LED panel's share of the `Led glow` ([led_glow_effect],
+    // 1 without it), z/w free
     glow: vec4<f32>,
 };
 @group(1) @binding(2) var<uniform> material: MaterialParams;
@@ -657,8 +668,16 @@ fn vertex_main(in_pos: vec3<f32>, in_normal: vec3<f32>, in_uv: vec2<f32>, in_ins
         // over the road it lies on - with the road's own pull alone the two fought for
         // every pixel and the road mostly won; a few centimetres more bring it through the
         // road and still leave it behind the body and the wheels standing on it)
-        let decal = select(select(0.0, 0.01 + 0.001 * d, surf > 1.1 && surf < 1.5), 0.05 + 0.002 * d, surf > 1.5);
-        let pull = min(0.003 * d + decal, d * 0.3);
+        // The share stops growing at 5 cm. The pull is a depth, not a place - the picture
+        // does not move - but the pole of a traffic light that a mod's map tagged as a
+        // surface is pulled with the road under it, and a share still growing at distance
+        // (a third of a metre at 90 m) carried the pole through the signal head it stands
+        // beside. Capped, the pole stays behind what it stands by, and the depth a road
+        // needs over flush ground is a few millimetres at most (a floor raised 3 cm above
+        // the road is still seen - `surface_bias_keeps_raised_floors_visible_at_a_distance`).
+        let share = select(select(0.003, 0.004, surf > 1.1 && surf < 1.5), 0.005, surf > 1.5);
+        let fixed = select(select(0.0, 0.01, surf > 1.1 && surf < 1.5), 0.05, surf > 1.5);
+        let pull = min(min(share * d, 0.05) + fixed, d * 0.3);
         cp = wp.xyz - to / max(d, 1e-3) * pull;
     }
     out.clip = camera.view_proj * vec4<f32>(cp, 1.0);
@@ -936,14 +955,9 @@ fn transmap_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
     return material.params.z > 0.5 && a >= 0.99;
 }
 
-// 1 = lit by the sun, 0 = in shadow. Two cascades: the near one (sharp, around the camera)
-// and the far one covering the rest of the visible street.
-const SHADOW_OFFSETS: array<vec2<f32>, 16> = array<vec2<f32>, 16>(
-    vec2<f32>(-0.942, -0.399), vec2<f32>(0.945, -0.769), vec2<f32>(-0.094, -0.929), vec2<f32>(0.345, 0.293),
-    vec2<f32>(-0.915, 0.458), vec2<f32>(-0.815, -0.879), vec2<f32>(-0.382, 0.276), vec2<f32>(0.974, 0.756),
-    vec2<f32>(0.443, -0.975), vec2<f32>(0.537, -0.474), vec2<f32>(-0.264, -0.418), vec2<f32>(0.792, -0.184),
-    vec2<f32>(-0.758, 0.827), vec2<f32>(-0.386, -0.938), vec2<f32>(-0.203, 0.768), vec2<f32>(0.147, -0.169)
-);
+// 1 = lit by the sun, 0 = in shadow. Three cascades: the close one (the bus and what is
+// next to it), the near one around the camera and the far one covering the rest of the
+// visible street.
 
 // Depth bias of the sun shadow, in metres along the sun's ray. The maps' depth runs over
 // the light box's 2199 m, and the comparison used to take off 0.0015 (near) and 0.004 (far)
@@ -980,45 +994,98 @@ fn shadow_receiver_slope(lvp: mat4x4<f32>, n: vec3<f32>) -> vec2<f32> {
     return clamp(g, vec2<f32>(-2.0), vec2<f32>(2.0));
 }
 
+// The filter's half width in texels. A tent of 2 texels covers 4 x 4 texels, two gathers a
+// side - four in all, fewer texture reads than the Poisson kernel's five (sixteen on an
+// edge) - and spreads an edge about as the old kernel did in the near and close cascades
+// (0.82 of a texel's standard deviation against 0.9 and 1.0; a fifth sharper in the far one).
+const SHADOW_TENT: f32 = 2.0;
+// Percentage-closer filtering with a tent of `SHADOW_TENT` texels, every texel of the map
+// under it compared and weighted by the tent at its centre: four gathers of 2 x 2 texels,
+// the whole 4 x 4 footprint read. The sparse Poisson kernel this replaces (16 bilinear taps
+// 1.6 to 2.2 texels apart, and only its 5 outermost-and-middle taps when those agreed)
+// sampled the map coarser than its texels: a lit gap between leaves, a few texels wide, came
+// out as a copy of the kernel - an X of five magnified texels - and a feature lying between
+// the taps vanished and reappeared as the receiver moved by a texel, which made the shadows
+// shimmer. Read in full, the result is a continuous function of the receiver's position.
+// `widen` (Enhanced: a veil of high cloud enlarging the sun) spreads the four gathers that
+// many texels apart, a tent as much wider, without reading more.
+// `uv`: the receiver in the cascade's own 0..1; `size`: the cascade's texels a side;
+// `origin`: where its first texel lies in the texture; `slope`: its receiver plane (per uv).
+// The shadow maps' size, texels a side, from the uniforms (`camera.shadow.y` is a texel): the
+// near map an atlas of two cascades side by side, the far one `FAR_MAP_ASPECT` (1.25) times
+// as high for the street lamps' tiles under it. (Asked of the textures with
+// textureDimensions in every inlined use of the sun's shadow, they brought Apple's M4 shader
+// compiler down on every scene pipeline.)
+fn shadow_map_size() -> f32 {
+    return 1.0 / max(camera.shadow.y, 1e-6);
+}
+
+fn shadow_tent_place(uv: vec2<f32>, size: f32, widen: f32) -> vec4<f32> {
+    let k = max(1.0, floor(widen + 0.5));
+    // (texel i of the cascade has its centre at p = i; the first texel the tent reaches)
+    let p = uv * size - vec2<f32>(0.5);
+    let lo = floor(p - vec2<f32>(SHADOW_TENT * k)) + vec2<f32>(1.0);
+    return vec4<f32>(p, lo);
+}
+
+// The tent's weights of a gather's four texels starting at `t0` (gather order: (0, 1),
+// (1, 1), (1, 0), (0, 0) of the quad).
+fn shadow_tent_weights(t0: vec2<f32>, p: vec2<f32>, r: f32) -> vec4<f32> {
+    let w0 = max(vec2<f32>(0.0), vec2<f32>(1.0) - abs(t0 - p) / r);
+    let w1 = max(vec2<f32>(0.0), vec2<f32>(1.0) - abs(t0 + vec2<f32>(1.0) - p) / r);
+    return vec4<f32>(w0.x * w1.y, w1.x * w1.y, w1.x * w0.y, w0.x * w0.y);
+}
+
+fn shadow_tent_near(uv: vec2<f32>, size: f32, origin: vec2<f32>, z: f32, slope: vec2<f32>, widen: f32, bias: f32) -> f32 {
+    let dims = vec2<f32>(2.0, 1.0) * shadow_map_size();
+    let pl = shadow_tent_place(uv, size, widen);
+    let k = max(1.0, floor(widen + 0.5));
+    let r = SHADOW_TENT * k;
+    var sum = 0.0;
+    var wsum = 0.0;
+    for (var q = 0; q < 4; q = q + 1) {
+        let t0 = pl.zw + vec2<f32>(f32(q & 1), f32(q >> 1u)) * 2.0 * k;
+        let a = (origin + t0 + vec2<f32>(1.0)) / dims;
+        let zr = z + dot(slope, (t0 + vec2<f32>(0.5) - pl.xy) / size) - bias;
+        let w = shadow_tent_weights(t0, pl.xy, r);
+        sum = sum + dot(textureGatherCompare(t_shadow, s_shadow, a, zr), w);
+        wsum = wsum + w.x + w.y + w.z + w.w;
+    }
+    return sum / max(wsum, 1e-6);
+}
+
+fn shadow_tent_far(uv: vec2<f32>, size: f32, z: f32, slope: vec2<f32>, widen: f32, bias: f32) -> f32 {
+    let dims = vec2<f32>(1.0, floor(shadow_map_size() * 1.25) / shadow_map_size()) * shadow_map_size();
+    let pl = shadow_tent_place(uv, size, widen);
+    let k = max(1.0, floor(widen + 0.5));
+    let r = SHADOW_TENT * k;
+    var sum = 0.0;
+    var wsum = 0.0;
+    for (var q = 0; q < 4; q = q + 1) {
+        let t0 = pl.zw + vec2<f32>(f32(q & 1), f32(q >> 1u)) * 2.0 * k;
+        let a = (t0 + vec2<f32>(1.0)) / dims;
+        let zr = z + dot(slope, (t0 + vec2<f32>(0.5) - pl.xy) / size) - bias;
+        let w = shadow_tent_weights(t0, pl.xy, r);
+        sum = sum + dot(textureGatherCompare(t_shadow_far, s_shadow, a, zr), w);
+        wsum = wsum + w.x + w.y + w.z + w.w;
+    }
+    return sum / max(wsum, 1e-6);
+}
+
 // The near map is an atlas two cascades wide: the near cascade in its left half, the close
-// one (`camera.light_view_proj_close`) in its right half. `uv` is the cascade's own 0..1.
-// The kernel's four outermost taps (SHADOW_OFFSETS 5, 1, 7, 12: one in each corner) and
-// the one nearest its middle (15, which catches a pole's shadow thinner than the kernel)
-// are taken first: when they agree - all lit or all in shadow - the pixel is not in a
-// penumbra and the other eleven would agree too. Most of a picture is plainly lit or
-// plainly shaded, so the filter mostly costs 5 compares instead of 16.
-const SHADOW_CORNERS: array<i32, 5> = array<i32, 5>(5, 1, 7, 12, 15);
-const SHADOW_REST: array<i32, 11> = array<i32, 11>(0, 2, 3, 4, 6, 8, 9, 10, 11, 13, 14);
-
-// `scale`: the share of its half of the atlas the cascade fills from the top left (the close
-// cascade is drawn no bigger than 2048 texels, see `SHADOW_CLOSE_MAX` in lib.rs).
-fn shadow_pcf_atlas(uv: vec2<f32>, z: f32, slope: vec2<f32>, texel: f32, half: f32, spread: f32, bias: f32, scale: f32) -> f32 {
-    var corners = 0.0;
-    for (var k = 0; k < 5; k = k + 1) {
-        let o = SHADOW_OFFSETS[SHADOW_CORNERS[k]] * texel * spread;
-        let a = vec2<f32>((uv.x + o.x) * 0.5 * scale + half, (uv.y + o.y) * scale);
-        corners = corners + textureSampleCompareLevel(t_shadow, s_shadow, a, z + dot(slope, o) - bias);
-    }
-    if (corners <= 0.0 || corners >= 5.0) {
-        return corners * 0.2;
-    }
-    var sum = corners;
-    for (var k = 0; k < 11; k = k + 1) {
-        let o = SHADOW_OFFSETS[SHADOW_REST[k]] * texel * spread;
-        let a = vec2<f32>((uv.x + o.x) * 0.5 * scale + half, (uv.y + o.y) * scale);
-        sum = sum + textureSampleCompareLevel(t_shadow, s_shadow, a, z + dot(slope, o) - bias);
-    }
-    return sum / 16.0;
+// one (`camera.light_view_proj_close`) from the top left of its right half, drawn no bigger
+// than 2048 texels (`SHADOW_CLOSE_MAX` in lib.rs). `widen`: how much wider than the
+// cascade's own the filter is (Enhanced: a veil of high cloud enlarging the sun).
+fn shadow_pcf_near(uv: vec2<f32>, z: f32, slope: vec2<f32>, widen: f32) -> f32 {
+    let size = shadow_map_size();
+    return shadow_tent_near(uv, size, vec2<f32>(0.0), z, slope, widen, SHADOW_BIAS_NEAR / SHADOW_DEPTH_RANGE);
 }
 
-fn shadow_pcf_near(uv: vec2<f32>, z: f32, slope: vec2<f32>, texel: f32) -> f32 {
-    return shadow_pcf_atlas(uv, z, slope, texel, 0.0, 1.6, SHADOW_BIAS_NEAR / SHADOW_DEPTH_RANGE, 1.0);
-}
-
-fn shadow_pcf_close(uv: vec2<f32>, z: f32, slope: vec2<f32>, texel: f32) -> f32 {
+fn shadow_pcf_close(uv: vec2<f32>, z: f32, slope: vec2<f32>) -> f32 {
     // (camera.post.w: the close map's size over the near map's)
-    let scale = select(1.0, camera.post.w, camera.post.w > 0.0);
-    return shadow_pcf_atlas(uv, z, slope, texel / scale, 0.5, 1.8, SHADOW_BIAS_CLOSE / SHADOW_DEPTH_RANGE, scale);
+    let half = shadow_map_size();
+    let size = half * select(1.0, camera.post.w, camera.post.w > 0.0);
+    return shadow_tent_near(uv, size, vec2<f32>(half, 0.0), z, slope, 1.0, SHADOW_BIAS_CLOSE / SHADOW_DEPTH_RANGE);
 }
 
 fn shadow_push_close(n: vec3<f32>, ndl: f32) -> vec3<f32> {
@@ -1044,32 +1111,14 @@ fn shadow_close(world: vec3<f32>, n: vec3<f32>, ndl: f32, thin: bool) -> vec2<f3
         return vec2<f32>(1.0, 0.0);
     }
     let slope = select(shadow_receiver_slope(camera.light_view_proj_close, n), vec2<f32>(0.0), thin);
-    return vec2<f32>(shadow_pcf_close(uv, lp.z, slope, camera.shadow.y), w);
+    return vec2<f32>(shadow_pcf_close(uv, lp.z, slope), w);
 }
 
-// The far map takes the top of its texture; the street lamps' tiles lie under it
-// (`FAR_MAP_ASPECT` in lib.rs).
-fn far_map_uv(uv: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(uv.x, uv.y * 0.8);
-}
-
-fn shadow_pcf_far(uv: vec2<f32>, z: f32, slope: vec2<f32>, texel: f32) -> f32 {
-    let bias = SHADOW_BIAS_FAR / SHADOW_DEPTH_RANGE;
-    // (corners first, as in `shadow_pcf_atlas`)
-    var corners = 0.0;
-    for (var k = 0; k < 5; k = k + 1) {
-        let o = SHADOW_OFFSETS[SHADOW_CORNERS[k]] * texel * 2.2;
-        corners = corners + textureSampleCompareLevel(t_shadow_far, s_shadow, far_map_uv(uv + o), z + dot(slope, o) - bias);
-    }
-    if (corners <= 0.0 || corners >= 5.0) {
-        return corners * 0.2;
-    }
-    var sum = corners;
-    for (var k = 0; k < 11; k = k + 1) {
-        let o = SHADOW_OFFSETS[SHADOW_REST[k]] * texel * 2.2;
-        sum = sum + textureSampleCompareLevel(t_shadow_far, s_shadow, far_map_uv(uv + o), z + dot(slope, o) - bias);
-    }
-    return sum / 16.0;
+// The far map takes the top of its texture (its texels are the texture's first rows); the
+// street lamps' tiles lie under it (`FAR_MAP_ASPECT` in lib.rs).
+fn shadow_pcf_far(uv: vec2<f32>, z: f32, slope: vec2<f32>, widen: f32) -> f32 {
+    let size = shadow_map_size();
+    return shadow_tent_far(uv, size, z, slope, widen, SHADOW_BIAS_FAR / SHADOW_DEPTH_RANGE);
 }
 
 // The shadow lookup point: pushed off the surface along its normal by about a texel of the
@@ -1098,9 +1147,8 @@ fn sun_shadow(world_in: vec3<f32>, n: vec3<f32>, thin: bool) -> f32 {
     let near_lp = camera.light_view_proj * vec4<f32>(world + shadow_push_near(n, ndl), 1.0);
     let near_uv = vec2<f32>(near_lp.x * 0.5 + 0.5, 0.5 - near_lp.y * 0.5);
     let inside = max(abs(near_uv.x - 0.5), abs(near_uv.y - 0.5));
-    let t = camera.shadow.y;
     if (inside < 0.48 && near_lp.z >= 0.0 && near_lp.z <= 1.0) {
-        let nv = shadow_pcf_near(near_uv, near_lp.z, select(shadow_receiver_slope(camera.light_view_proj, n), vec2<f32>(0.0), thin), t);
+        let nv = shadow_pcf_near(near_uv, near_lp.z, select(shadow_receiver_slope(camera.light_view_proj, n), vec2<f32>(0.0), thin), 1.0);
         return mix(nv, close.x, close.y);
     }
     let lp = camera.light_view_proj_far * vec4<f32>(world + shadow_push_far(n, ndl), 1.0);
@@ -1108,7 +1156,7 @@ fn sun_shadow(world_in: vec3<f32>, n: vec3<f32>, thin: bool) -> f32 {
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || lp.z < 0.0 || lp.z > 1.0) {
         return 1.0;
     }
-    let sum = shadow_pcf_far(uv, lp.z, select(shadow_receiver_slope(camera.light_view_proj_far, n), vec2<f32>(0.0), thin), t);
+    let sum = shadow_pcf_far(uv, lp.z, select(shadow_receiver_slope(camera.light_view_proj_far, n), vec2<f32>(0.0), thin), 1.0);
     let edge = clamp((0.5 - max(abs(uv.x - 0.5), abs(uv.y - 0.5))) * 12.0, 0.0, 1.0);
     return mix(1.0, sum, edge);
 }
@@ -2113,7 +2161,12 @@ fn shade_vanilla(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) ->
         // of the MAN NL/NG (Fenster.tga, factor 0.5, the sky at the sphere map's bottom) lay
         // milky white over the unlit gauges. (Vanilla+ as well: its linear lerp laid the
         // sphere map as a grey sheen over every dark window band and chassis, #780.)
-        lit = srgb_decode(mix(srgb_encode(lit), srgb_encode(env.rgb), kk));
+        // The sphere map is a photograph taken by day: what it shows is lit by the light there
+        // is now - the ambient light and `g` (the day's light and the lamps), each at most 1 -
+        // so that by night, at dusk and under a closed sky the bus mirrors a dark street and
+        // not a sunny one. (By day both reach 1 and the photograph is as it was.)
+        let env_lit = env.rgb * min(camera.ambient.rgb + vec3<f32>(g), vec3<f32>(1.0));
+        lit = srgb_decode(mix(srgb_encode(lit), srgb_encode(env_lit), kk));
     }
     // wet road: a surface whose texture carries [moisture] darkens under rain and starts
     // to mirror the sky, strongest where you look along it (the Fresnel sheen that makes a

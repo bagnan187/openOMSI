@@ -156,6 +156,7 @@ impl PlayerDuty {
             picked,
             first_update: None,
             heading: 0.0,
+            position: None,
         }
     }
 
@@ -535,8 +536,13 @@ impl PlayerDuty {
     }
 
     /// How late the bus is (s; negative = early), as the IBIS shows it: at a stop against
-    /// its departure there, on the way at least as late as it left the last stop and later
-    /// once the next one is overdue, and at the end of a trip against the next trip's start.
+    /// its departure there, on the way against the time the timetable has it where it is -
+    /// the last stop's departure and the next one's arrival shared out by how far it has
+    /// come between them, as OMSI shows it while driving (it stood still between the stops
+    /// at the delay the bus left the last one with, #1898, #735) - and at the end of a trip
+    /// against the next trip's start. The shares are the straight distances to the stop
+    /// left and the stop ahead, as Omsi.exe weighs the two times for `GetTTDelay` (0x61f59c
+    /// measures them, 0x7d5124 weighs).
     pub fn delay(&self, now: f64) -> f64 {
         let now = self.duty_time(now);
         let trip = self.trip();
@@ -552,6 +558,16 @@ impl PlayerDuty {
             return now - stop.dep;
         }
         let due = now - stop.arr;
+        let last = self.next_stop.checked_sub(1).and_then(|k| trip.stops.get(k));
+        if let (Some(last), Some(at), Some(here), true) = (last, last.and_then(|s| s.position), self.position, self.left_late.is_some()) {
+            if let Some(next) = stop.position {
+                let (gone, left) = ((here - at).truncate().length(), (next - here).truncate().length());
+                if gone + left > 1.0 {
+                    let share = gone / (gone + left);
+                    return now - (last.dep + share * (stop.arr - last.dep));
+                }
+            }
+        }
         self.left_late.map(|l| l.max(due)).unwrap_or(due)
     }
 
@@ -575,6 +591,7 @@ impl PlayerDuty {
     pub fn update(&mut self, bus: &mut crate::VehicleInstance, day_time: f64) -> Option<(f64, f64)> {
         let day_time = self.duty_time(day_time);
         self.heading = bus.heading;
+        self.position = Some(bus.position);
         let served = self.advance(bus.position, day_time);
         if self.done
             && self.at_stop
@@ -618,28 +635,16 @@ impl PlayerDuty {
         let mut passenger_door_open = false;
         for i in 0..16 {
             for kind in ["Entry", "Exit"] {
-                let name = format!("PAX_{kind}{i}_Open");
-                if bus.has_script_var(&name)
-                    || bus
-                        .ty
-                        .program
-                        .var(&name)
-                        .is_some_and(|id| bus.ty.program.stores(id))
-                {
+                if bus.pax_reports_open(kind, i) {
                     reports_passenger_doors = true;
-                    passenger_door_open |= bus.var(&name).unwrap_or(0.0) > 0.5;
+                    passenger_door_open |= bus.pax_open(kind, i).unwrap_or(0.0) > 0.5;
                 }
             }
         }
         if reports_passenger_doors {
             passenger_door_open
         } else {
-            (0..8).any(|i| {
-                bus.var(&format!("door_{i}"))
-                    .or_else(|| bus.var(&format!("door{i}")))
-                    .unwrap_or(0.0)
-                    > 0.5
-            })
+            (0..8).any(|i| bus.door_anim(i).unwrap_or(0.0) > 0.5)
         }
     }
 
@@ -666,7 +671,10 @@ impl PlayerDuty {
             host.tt_stop_ids = trip.stops.iter().map(|s| s.object_id).collect();
             host.tt_busstop_index = self.next_stop as i32;
             host.tt_terminus_index = tt_terminus_index(host.hof.as_deref(), &trip.terminus);
-            host.tt_delay = delay as f32;
+            // (whole seconds, as Omsi.exe keeps it: an integer field of the vehicle, the
+            // clock's second less the timetable's interpolated one, each rounded - 0x7d5124 -
+            // so a bus 0.3 s behind is not yet late to the scripts' `GetTTDelay > 0`)
+            host.tt_delay = delay.round() as f32;
         }
         // Aachen's ibox keeps its own stop counter and does `+ 1` when
         // `GetTTBusstopIndex` changes. A jump of more than one stop, or a unit that only

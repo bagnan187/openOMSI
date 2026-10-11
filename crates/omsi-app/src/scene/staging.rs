@@ -19,6 +19,8 @@ pub struct ObjectType {
     pub mesh_shadow: Vec<bool>,
     /// `[shadow]` per loaded mesh: the meshes OMSI casts (stencil) shadows from.
     pub mesh_casts: Vec<bool>,
+    /// Whether any loaded mesh carries a `[mouseevent]`.
+    pub has_mouse_events: bool,
     /// Compiled scripts when the object is scripted or animated.
     pub program: Option<Arc<omsi_script::Program>>,
     /// Further `[LOD]` levels: (min screen size, meshes), in model order after LOD 0.
@@ -196,6 +198,88 @@ pub(super) fn is_white_lightmap(rgba: &[u8]) -> bool {
     !rgba.is_empty() && rgba.chunks_exact(4).all(|p| p[0] >= 242 && p[1] >= 242 && p[2] >= 242)
 }
 
+/// A texel is solid from here on (0.90 of full): the parked Hong Kong buses' paint is
+/// 245/255 (0.96) and a blend of that over the scenery behind it is invisible.
+const BLEND_SOLID_ALPHA: u8 = 230;
+/// How much of a picture may carry a *partial* alpha and still be a cut-out: one texel in
+/// this many. Measured over the shapes that come up: a cut-out's antialiased outline is a
+/// fraction of a percent (the parked buses' body pictures 0.31 - 0.47 %), while a soft
+/// shadow blob is 7.75 % and a genuinely translucent side panel 69 %.
+const CUTOUT_FADE_DIVISOR: usize = 64;
+
+/// What a `[matl_alpha] 2` slot has to blend by - read from its picture, once per file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlendFade {
+    /// No alpha channel, or one that is 255 throughout: there is nothing to blend by, so
+    /// the slot has to be drawn opaque.
+    Solid,
+    /// The alpha is a cut-out - every texel is clear (0) or solid, and only the
+    /// antialiased outline lies in between: the slot has to be drawn alpha-tested, so that
+    /// its solid part writes depth.
+    Cutout,
+    /// Real partial transparency - glass, a feathered road border: the slot stays a blend.
+    Partial,
+}
+
+/// How a slot declared `alpha` is drawn, given what its picture has to blend by (`fade`):
+/// nothing - opaque; a cut-out - alpha-tested. A cut-out alpha has nothing to blend by either,
+/// and a blend leaves the slot without depth: every road and pavement spline of the map is
+/// drawn in the phase AFTER the `[rendertype] surface` object, and a no-write blend let them
+/// come straight over it and eat its picture (the parked Hong Kong buses). Alpha-tested, the
+/// solid part of the object writes depth and the cut-away part is discarded, which is the
+/// picture Omsi.exe shows.
+pub(super) fn blend_alpha(alpha: omsi_render::AlphaMode, fade: Option<BlendFade>) -> omsi_render::AlphaMode {
+    use omsi_render::AlphaMode;
+    match (alpha, fade) {
+        (AlphaMode::Blend, Some(BlendFade::Solid)) => AlphaMode::Opaque,
+        (AlphaMode::Blend, Some(BlendFade::Cutout)) => AlphaMode::Test,
+        _ => alpha,
+    }
+}
+
+/// How the picture at `path` reads as the transparency of a `[matl_alpha] 2` slot (read once
+/// per file). A slot whose picture has nothing to blend by is drawn opaque (the GG2 signs'
+/// pictures, `directions\temp_1.png`, `terminal_east_2.tga`, are 255 throughout), and one
+/// whose picture is a cut-out is drawn alpha-tested: left a no-write blend, the phases drawn
+/// after it - the surfaces of every road and pavement are drawn after every
+/// `[rendertype] surface` object - came over it and ate its texture, which is what the parked
+/// buses (`Sceneryobjects\M3 Obj\Citybus\5xx.sco` and its kin) showed as a bus with its
+/// picture eaten away by the scenery round it.
+pub(super) fn picture_blend_fade(path: &Path) -> BlendFade {
+    static MEMO: std::sync::OnceLock<Mutex<HashMap<PathBuf, BlendFade>>> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = memo.lock().get(path) {
+        return *v;
+    }
+    let v = match omsi_texture::decode_file(path) {
+        // a picture that cannot be read has to keep the blend it declared
+        Err(_) => BlendFade::Partial,
+        Ok(i) if !i.has_alpha => BlendFade::Solid,
+        Ok(i) => {
+            let mut texels = 0usize;
+            let mut fading = 0usize;
+            let mut below_full = false;
+            for p in i.rgba.chunks_exact(4) {
+                texels += 1;
+                let a = p[3];
+                below_full |= a != 255;
+                if a != 0 && a < BLEND_SOLID_ALPHA {
+                    fading += 1;
+                }
+            }
+            if !below_full {
+                BlendFade::Solid
+            } else if fading * CUTOUT_FADE_DIVISOR <= texels {
+                BlendFade::Cutout
+            } else {
+                BlendFade::Partial
+            }
+        }
+    };
+    memo.lock().insert(path.to_path_buf(), v);
+    v
+}
+
 /// [`is_white_lightmap`] of the light map `name` (found in `dirs`, read once per file);
 /// `None` when the file is not there.
 pub(super) fn lightmap_is_white(name: &str, dirs: &[&Path]) -> Option<bool> {
@@ -329,6 +413,19 @@ pub struct PageHit {
     pub v: f32,
 }
 
+/// Where a ray lands on a mesh of a scenery object with a `[mouseevent]`: see
+/// [`World::scenery_object_hit`].
+#[derive(Clone, Debug)]
+pub struct SceneryHit {
+    /// Distance (m) along the ray.
+    pub t: f32,
+    pub map_id: i64,
+    #[allow(dead_code)]
+    pub mesh_index: usize,
+    /// The event name from the mesh's `[mouseevent]`.
+    pub event: String,
+}
+
 /// What the timetable tells the scenery: the time of day, and the buses due at the stops
 /// whose departure displays are near (see [`World::timetable_boards`]).
 #[derive(Default)]
@@ -346,7 +443,7 @@ pub struct StopBoards {
     pub wanted_names: Vec<String>,
     /// Per stop name of `wanted_names`: the departures of the next two hours, soonest first,
     /// at most 20, as (line, destination, timestamp).
-    pub departures: std::collections::HashMap<String, Vec<(String, String, f64)>>,
+    pub departures: std::collections::HashMap<String, Vec<omsi_sim::vehicle_api::Departure>>,
     /// Counts up whenever `departures` was made anew.
     pub departures_gen: u64,
 }
@@ -456,6 +553,8 @@ pub struct SplineType {
     pub dir: PathBuf,
     /// The `.surf` map of each of `def.textures` (see [`surf_map`]).
     pub surf: Vec<Option<Arc<omsi_geometry::HeightMap>>>,
+    /// The `[surface]` id of each of them (see [`surface_id`]).
+    pub surface: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -752,6 +851,9 @@ pub struct StagedTile {
     /// The street lanes' points of the tile's splines, kept for good (what an object's box
     /// is checked against: a road through it makes it no wall).
     pub(super) street_points: Vec<DVec3>,
+    /// What sounds along the tile's splines: its road lanes and railway tracks (with their
+    /// speed limit), its overhead wires and tunnels - world points every few metres.
+    pub(super) sound_lines: Vec<(omsi_geometry::LineKind, f32, Vec<DVec3>)>,
     pub(super) objects: Vec<StagedObject>,
     /// The spline attachment rows `[attachObj]` records can hang on: (row id, where its first
     /// object stands, the row's own type - a car park row's, not its car's).
@@ -1012,7 +1114,7 @@ pub(super) struct TypeGpu {
     pub(super) variants: Vec<(usize, usize, MaterialId, MaterialId, String)>,
     /// Dynamic texture overrides, made only for combinations that placed scripts use.
     /// Rows align with LOD 0 meshes and material slots; each entry holds (base, item).
-    pub(super) dynamic_texture_variants: HashMap<Vec<usize>, Vec<Vec<Option<(MaterialId, MaterialId)>>>>,
+    pub(super) dynamic_texture_variants: HashMap<Vec<usize>, Arc<Vec<Vec<Option<(MaterialId, MaterialId)>>>>>,
     /// Lower LODs: (min size, max size, meshes).
     pub(super) lods: Vec<(f32, f32, Vec<(MeshId, Vec<MaterialId>)>)>,
     pub(super) materials: Vec<MaterialId>,
@@ -1047,8 +1149,10 @@ pub(super) struct TreeGpu {
     pub(super) users: usize,
 }
 
-/// Materials every tile shares (never freed).
+/// Materials every tile shares (never freed; made again for another season's textures).
 pub(super) struct GroundGpu {
+    /// The season's texture folder they were made with (`omsi_texture::season_folder`).
+    pub(super) season: Option<String>,
     pub(super) ground_id: Option<TextureId>,
     pub(super) ground_mat: MaterialId,
     pub(super) plain_terrain_mat: MaterialId,

@@ -139,9 +139,12 @@ impl World {
             .collect()
     }
 
-    /// The materials every tile shares: the plain ground, the water, the tree quad.
+    /// The materials every tile shares: the plain ground, the water, the tree quad - made
+    /// again when the season's textures changed (a snow weather came while driving: the tiles
+    /// read again took the summer grass of the first ones, and the ground stayed green).
     pub(super) fn ensure_ground(&self, renderer: &Renderer, scene: &mut Scene, gpu: &mut GpuCache) {
-        if gpu.ground.is_some() {
+        let season = omsi_texture::season_folder();
+        if gpu.ground.as_ref().is_some_and(|g| g.season == season) {
             return;
         }
         let none: HashMap<PathBuf, Arc<TextureData>> = HashMap::new();
@@ -256,6 +259,7 @@ impl World {
         };
         let tree_mesh = renderer.add_mesh(scene, &tree_quad_mesh());
         gpu.ground = Some(GroundGpu {
+            season,
             ground_id,
             ground_mat,
             plain_terrain_mat,
@@ -396,14 +400,30 @@ impl World {
                     omsi_scenery::sco::RenderType::Surface | omsi_scenery::sco::RenderType::OnSurface
                 );
                 let faded = slot_ov.iter().any(|o| o.alphascale.as_ref().is_some_and(|v| !v.trim().is_empty()));
-                let alpha = if alpha == AlphaMode::Blend && surface_phase && tex.is_some() && transmap.is_none() && !faded && {
-                    let dirs_ref: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
-                    omsi_texture::find_texture(&m.texture, &dirs_ref).is_some_and(|p| gpu.textures.get(&p).is_some_and(|e| !e.alpha))
-                } {
-                    AlphaMode::Opaque
+                // A blend with no alpha to take it from is opaque, whatever the picture is
+                // made of: one with no alpha channel, one whose alpha channel has no
+                // transparent texel at all (the GG2 signs' `directions\*.png` pictures are
+                // fully opaque), and one whose texture is missing altogether (the fallback
+                // there is the opaque white). Omsi.exe's blend writes depth in all of them;
+                // left a no-write blend, the surface phases drawn after the slot came over
+                // it and ate it - the signs' blue faded away into the background, and so did
+                // the bare gantry panel. (Not a slot that has no texture on purpose:
+                // `[useTextTexture]` / `[useScriptTexture]` draw their own picture, which
+                // blends by its alpha.)
+                //
+                // A picture whose alpha is a cut-out (clear or solid, only its antialiased
+                // outline between: see `picture_blend_fade`) is the same case one step on -
+                // nothing to blend by but the cut-away part - and is drawn alpha-tested so
+                // that the solid part of the object writes depth.
+                let blend_fade = if !surface_phase || transmap.is_some() || faded || generated || is_null_texture(&m.texture) {
+                    None
+                } else if tex.is_none() {
+                    Some(super::staging::BlendFade::Solid)
                 } else {
-                    alpha
+                    let dirs_ref: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
+                    omsi_texture::find_texture(&m.texture, &dirs_ref).map(|p| super::staging::picture_blend_fade(&p))
                 };
+                let alpha = super::staging::blend_alpha(alpha, blend_fade);
                 // [matl_envmap]: the same reflection rule as on vehicles (factor x mask; a
                 // texture without an alpha channel reads as a full mask)
                 let envmap = match slot_ov.iter().find_map(|o| o.envmap.clone()) {

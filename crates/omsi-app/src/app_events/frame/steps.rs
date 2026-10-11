@@ -29,6 +29,9 @@ pub(crate) fn traffic_tick(
     t.other_blinkers = outline_indicators(remotes, player, placed);
     if !paused {
         t.player_priority = player.and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
+        // (a LAN player's emergency vehicle: its scripts' variables come over the network,
+        // `omsi_net::vars`, for a copy of the same vehicle files)
+        t.other_priority = remotes.remotes.iter().filter(|(_, r)| r.vehicle().var("TrafficPriority").is_some_and(|v| v > 0.5)).map(|(id, _)| *id).collect();
         t.player_blinker = player.map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
         t.tick(view, dt, player.map(|p| player_outline(p)));
         world.set_switches(&t.switch_requests());
@@ -57,7 +60,7 @@ pub(crate) fn deliver_player_impacts(p: &mut Player, traffic: Option<&mut traffi
 pub(crate) fn gloomy_weather(weather: Option<&omsi_content::weather::Weather>) -> bool {
     weather.map(|w| {
         let (kind, rate) = precip_of(w);
-        w.fog.0 < 600.0 || (kind != 0 && rate > 0.05) || w.clouds.0.trim().to_ascii_lowercase().starts_with("overcast")
+        w.fog.0 < 600.0 || (kind != 0 && rate > 0.05) || w.clouds.0.trim().as_bytes().get(..8).is_some_and(|p| p.eq_ignore_ascii_case(b"overcast"))
     }).unwrap_or(false)
 }
 
@@ -243,6 +246,7 @@ pub(crate) fn tick_humans(
     if let Some(t) = traffic {
         let (alighting, waiting) = h.stop_wishes();
         t.set_stop_wishes(alighting, waiting);
+        t.bus_loads = h.bus_loads();
         for (id, stop, secs) in h.take_holds() {
             t.hold_boarding(id, stop, secs);
         }
@@ -307,7 +311,11 @@ pub(crate) fn duty_step(
     {
         let clock = game_clock.unwrap_or(&p.vehicle.host.clock);
         let career = &*career;
-        crate::journey::note(journey, d, due, served, root, || crate::journey::head(career, &world.global.name, &p.vehicle, clock));
+        crate::journey::note(journey, d, due, served, p.vehicle.odometer_km(), root, || crate::journey::head(career, &world.global.name, &p.vehicle, clock));
+    }
+    // (the trip's summary, for the game to show)
+    if let (Some(f), Some(j)) = (ended.as_ref(), journey.as_mut()) {
+        j.trip_ended(f.index);
     }
     if let Some(events) = plugin_events {
         use omsi_plugin::InfoValue::{Num, Text};
@@ -338,7 +346,9 @@ pub(crate) fn duty_step(
 }
 
 /// The tyres' spray (see `puddles`): what every vehicle's tyres throw up from the water on
-/// the road, `wetness` as wet as the picture draws it, the air moving with `wind`.
+/// the road, `wetness` as wet as the picture draws it, the air moving with `wind`. At a
+/// lower `quality` (`rain::quality`) only the player's bus throws spray (1), or none (0):
+/// what is in the air settles all the same.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn throw_spray(
     spray: &mut puddles::Spray,
@@ -350,15 +360,18 @@ pub(crate) fn throw_spray(
     wind: Vec3,
     world: &World,
     wetness: f32,
+    quality: u8,
 ) {
     let mut vehicles: Vec<(u64, &omsi_sim::VehicleInstance)> = Vec::new();
-    if let Some(p) = player {
+    if let Some(p) = player.filter(|_| quality > 0) {
         vehicles.push((0, &p.vehicle));
     }
-    if let Some(t) = traffic {
-        vehicles.extend(t.cars.iter().map(|c| (c.id.wrapping_add(1), &c.vehicle)));
+    if quality >= 2 {
+        if let Some(t) = traffic {
+            vehicles.extend(t.cars.iter().map(|c| (c.id.wrapping_add(1), &c.vehicle)));
+        }
+        vehicles.extend(remotes.remotes.iter().map(|(id, r)| (puddles::REMOTE_KEY | *id as u64, r.vehicle())));
     }
-    vehicles.extend(remotes.remotes.iter().map(|(id, r)| (puddles::REMOTE_KEY | *id as u64, r.vehicle())));
     spray.frame(dt, &vehicles, eye, wind, &|x, y| puddles::water_at(x, y, world.wet_road_at(x, y, wetness)));
 }
 
@@ -388,7 +401,7 @@ pub(crate) fn light_vehicles<'a>(
 pub(crate) fn picture_lighting(
     daylight: &omsi_sim::Daylight,
     weather: Option<&omsi_content::weather::Weather>,
-    cloud_drift: [f32; 2],
+    cloud_drift: [f32; 4],
     wetness: f32,
     world: Option<&World>,
     inside: Option<&omsi_sim::VehicleInstance>,
@@ -444,19 +457,18 @@ pub(crate) fn departure_boards(
     world: &World,
     traffic: Option<&traffic::Traffic>,
     duty: Option<&schedule::PlayerDuty>,
-    player_hof: Option<&omsi_vehicle::Hof>,
     clock: &omsi_sim::SimClock,
 ) {
     match schedule {
-        Some(s) => s.update_boards(world, traffic, duty, player_hof, clock),
+        Some(s) => s.update_boards(world, traffic, duty, clock),
         None => world.timetable_boards.lock().clock = Some(clock.clone()),
     }
 }
 
 /// The mirror panels follow the bus's mirrors (their aspects and glass from the world).
 pub(crate) fn mirror_hud_sync(hud: &mut crate::mirror_hud::MirrorHud, world: &World, p: &Player, mode: u8) {
-    hud.set_aspects(world.mirror_aspect.lock().clone());
-    hud.set_glass(world.mirror_glass.lock().clone());
+    hud.set_aspects(&world.mirror_aspect.lock());
+    hud.set_glass(&world.mirror_glass.lock());
     hud.sync(p, mode);
 }
 
