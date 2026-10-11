@@ -271,6 +271,18 @@ jobs:
       # (.github/workflows/sync-upstream.yml) is where that could happen. A failure here
       # publishes nothing, exactly like a merge that conflicts, so a silent loss is a red run
       # and no update rather than a release without the feature.
+      # Keep generated debug-flag docs in sync after merging upstream changes.
+      - name: Regenerate debug flags documentation
+        shell: pwsh
+        run: |
+          $env:OMSI_FLAGS_BLESS = '1'
+          try {
+            cargo test --release --target $env:TARGET -p omsi-cfg --lib flags_doc_up_to_date
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to regenerate debug flags documentation' }
+          } finally {
+            Remove-Item Env:OMSI_FLAGS_BLESS -ErrorAction SilentlyContinue
+          }
+
       - name: What the fork adds is still whole
         shell: pwsh
         run: |
