@@ -34,6 +34,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish validated Windows build"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -72,6 +77,22 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "OPENOMSI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "openOMSI $version"
+
+      # Point the compiled auto-updater to the user's OWN fork rather than Criisko's.
+      # Github repository must be a fork of Criisko/openOMSI with these changes.
+      - name: Configure this fork's auto-updater
+        shell: pwsh
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $parts = $repo.Split('/')
+          if ($parts.Count -ne 2) { throw "Unexpected repository name: $repo" }
+          $files = @('crates/omsi-app/src/updater.rs', 'crates/omsi-app/src/launcher/update.rs')
+          foreach ($path in $files) {
+            $src = [IO.File]::ReadAllText($path)
+            $dst = $src.Replace('Criisko/openOMSI', $repo)
+            if ($dst -eq $src) { throw "Updater fork reference missing: $path" }
+            [IO.File]::WriteAllText($path, $dst)
+          }
 
       - name: The ReShade workaround
         shell: pwsh
@@ -276,7 +297,7 @@ jobs:
         # A run started by hand builds and checks everything but publishes nothing, so the whole
         # pipeline can be tried out before the `push` trigger is put back. A push publishes, as
         # it always did.
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
