@@ -78,21 +78,38 @@ jobs:
           "OPENOMSI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "openOMSI $version"
 
-      # Point the compiled auto-updater to the user's OWN fork rather than Criisko's.
-      # Github repository must be a fork of Criisko/openOMSI with these changes.
+      # Configure release downloads to use this fork, while preserving the official
+      # openOMSI repository for bug reports and other project links. Idempotent:
+      # the Rust source may already contain the correct fork URLs after a merge.
       - name: Configure this fork's auto-updater
         shell: pwsh
         run: |
           $repo = $env:GITHUB_REPOSITORY
-          $parts = $repo.Split('/')
-          if ($parts.Count -ne 2) { throw "Unexpected repository name: $repo" }
-          $files = @('crates/omsi-app/src/updater.rs', 'crates/omsi-app/src/launcher/update.rs')
-          foreach ($path in $files) {
-            $src = [IO.File]::ReadAllText($path)
-            $dst = $src.Replace('Criisko/openOMSI', $repo)
-            if ($dst -eq $src) { throw "Updater fork reference missing: $path" }
-            [IO.File]::WriteAllText($path, $dst)
+          if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+            throw "Unexpected repository name: $repo"
           }
+          $path = 'crates/omsi-app/src/updater.rs'
+          $src = [IO.File]::ReadAllText($path)
+          $values = [ordered]@{
+            'REPO_URL' = 'https://github.com/openOMSI-org/openOMSI'
+            'RELEASES_REPO' = $repo
+            'RELEASES_URL' = "https://github.com/$repo"
+            'LATEST_API' = "https://api.github.com/repos/$repo/releases/latest"
+          }
+          foreach ($key in $values.Keys) {
+            # Change only the named constant; never rewrite test fixtures or project links.
+            $pattern = '(?m)^([ \t]*(?:pub )?const[ \t]+' + [regex]::Escape($key) + '[ \t]*:[ \t]*&str[ \t]*=[ \t]*")[^"\r\n]*(";[ \t]*)$'
+            $matches = [regex]::Matches($src, $pattern)
+            if ($matches.Count -ne 1) {
+              throw "Expected exactly one $key constant in $path; found $($matches.Count). Check upstream changes."
+            }
+            $replacement = '${1}' + $values[$key] + '${2}'
+            $src = [regex]::Replace($src, $pattern, $replacement)
+          }
+          [IO.File]::WriteAllText($path, $src)
+          # launcher/update.rs uses updater::RELEASES_REPO and updater::RELEASES_URL.
+          # It therefore needs no text replacement of its own.
+          Write-Host "Update source: $repo; issue reports: openOMSI-org/openOMSI"
 
       - name: The ReShade workaround
         shell: pwsh
